@@ -1,0 +1,96 @@
+/* imu_reader.nv: a reading loop that prints the acceleration, the rate of
+ * turn and the temperature of an MPU-6050 ten times a second
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *         or make this file the main of a package that depends on
+ *         mpu6050-nv and run
+ *             novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The part is an MPU-6050 on a breakout board, wired to the board's first
+ * I2C bus: SDA and SCL to the bus, VLOGIC to the supply, and AD0 to ground
+ * for the address 0x68 (to the supply for 0x69).  A line looks like
+ *
+ *     acc mg 12 -4 1003  gyr mdps 8 -15 3  temp mC 26125
+ *
+ * Lying flat and still, the board reads close to 0 on the x and y
+ * accelerometer axes, close to 1000 mg on z, and close to 0 on the gyroscope
+ * axes.  The program reads the paired sample through devices-nv's `Imu`
+ * trait, so both come from one instant, and the temperature through
+ * `Thermometer`.  It calls one method of the driver of its own, `begin`,
+ * which resets the part, checks WHO_AM_I, wakes it on the PLL and starts
+ * both sensors at 100 Hz, +-2 g and +-250 dps; that is why it names the
+ * driver module with `use`.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the UART and the
+ * timer.  It allocates nothing after it starts.
+ *
+ * Boards: the nRF52840-DK and the nRF54LM20-DK build this program, and
+ * their I2C buses are the TWIM drivers that landed in 0.24.1.  The part has
+ * not been read on a board: NOT VERIFIED.
+ */
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_imu.{ Imu }
+use dev_thermo.{ Thermometer }
+use dev_bus
+use mpu6050.{ Mpu6050 }
+
+// Writes `n`, 0 or more, in decimal, with at least `width` digits.
+// Formatting into a string would allocate, which @tier(embedded)
+// refuses, so each digit goes out as a byte.  An Int has at most 19
+// decimal digits, which bounds both loops.
+@tier(embedded)
+fn digits(n: Int, width: Int) [hw]
+    var div = 1
+    var w = 1
+    for _k in 0..18
+        if div <= n / 10 or w < width
+            div = div * 10
+            w = w + 1
+    for _k in 0..19
+        if div > 0
+            hal.uart.write_byte(48 + n / div % 10)
+            div = div / 10
+
+// Writes a signed number.
+@tier(embedded)
+fn signed(n: Int) [hw]
+    var m = n
+    if m < 0
+        hal.uart.write("-")
+        m = 0 - m
+    digits(m, 1)
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    // The part is not in the board's device table, so the program builds
+    // it from the first bus; the address is the breakout's.
+    let imu = Mpu6050.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, 0x68))
+    if not imu.begin()
+        hal.uart.write("mpu6050 did not start\n")
+    while true
+        match imu.imu_read()
+            Some(s) =>
+                hal.uart.write("acc mg ")
+                signed(s.accel.x)
+                hal.uart.write(" ")
+                signed(s.accel.y)
+                hal.uart.write(" ")
+                signed(s.accel.z)
+                hal.uart.write("  gyr mdps ")
+                signed(s.gyro.x)
+                hal.uart.write(" ")
+                signed(s.gyro.y)
+                hal.uart.write(" ")
+                signed(s.gyro.z)
+                match imu.temp_read()
+                    Some(t) =>
+                        hal.uart.write("  temp mC ")
+                        signed(t.milli_c)
+                    None    => hal.uart.write("  temp ?")
+                hal.uart.write("\n")
+            None    => hal.uart.write("no answer\n")
+        hal.timer.delay_ms(100)
