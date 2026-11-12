@@ -29,8 +29,8 @@ main    = "src/main.nv"
 
 [dependencies]
 mpu6050-nv        = { path = "$PKG" }
-devices-nv      = "^0.3.2"
-embedded-hal-nv = "^0.3.2"
+devices-nv      = { path = "$PKG/../devices-nv" }
+embedded-hal-nv = { path = "$PKG/../embedded-hal-nv" }
 EOF
 
 fail=0

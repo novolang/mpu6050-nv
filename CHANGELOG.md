@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
+are path dependencies until they are published.
+
+- `ImuControl` is implemented: `imu_ready` reads the shared data-ready flag,
+  `imu_set_rate_hz` and `imu_rate_hz` set and read the divider both sensors
+  share, and `imu_standby` sets the standby of the accelerometer's axes and the
+  gyroscope's in one write.
+- `Imu.imu_read_temp` answers the paired sample with the die temperature that
+  the same burst of fourteen registers holds.
+- `Accelerometer.accel_fifo_config(mode, watermark)` replaces the inherent
+  `fifo_begin(with_gyro)`. Behaviour change: the gyroscope is batched when its
+  axes are out of standby and not on request, and a watermark outside 1 to 32
+  is refused. The part has no watermark and no stop-on-full mode, so the
+  watermark is not used, `AccelFifoStop` is refused and
+  `accel_fifo_watermark_reached` stays the trait's `false`.
+- `gyro_range_write` refuses the five `GyroRange` values the part does not have
+  (`GyroRange15dps`, `31dps`, `62dps`, `125dps` and `4000dps`); `gyro_fs_of`
+  answers -1 for them.
+- The waits go through the bus's `delay_us`. The `timer` field of `Mpu6050` is
+  gone; `attach` is unchanged.
+
 ## 0.1.0
 
 The first release: a driver for TDK InvenSense's MPU-6050 six-axis motion

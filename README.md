@@ -91,7 +91,7 @@ nothing else. The driver performs no input or output of its own and
 allocates nothing of its own: every buffer is a fixed-size `Vec` in the
 caller's frame. The bus functions of devices-nv build one short frame per
 transaction inside a `system` block and release it when the call returns.
-The waits go through the board's timer, which is `[hw]` too. The package
+The waits go through the bus's `delay_us`, which is `[hw]` too. The package
 checks at every tier, `embedded` included.
 
 ## What it is
@@ -160,22 +160,23 @@ novo pkg add mpu6050-nv
 
 A program on a board uses `Mpu6050`, built by `attach` with the board's
 I2C bus, its GPIO and the wiring, as a board's device table builds it. It
-implements `Accelerometer`, `Gyroscope`, `Imu`, `Thermometer` and
+implements `Accelerometer`, `Gyroscope`, `Imu`, `ImuControl`, `Thermometer` and
 `Identifiable`.
 
 | Method | What it does |
 |---|---|
 | `attach(bus, pins, w)` | the part at `w.addr`; nothing is sent |
 | `begin()` | brings the part up, see below |
-| `accel_read()`, `gyro_read()`, `imu_read()` | `Accelerometer`, `Gyroscope`, `Imu`: milli-g, milli-degrees per second, and both from one burst of fourteen registers |
-| `accel_ready()`, `gyro_ready()` | DATA_RDY_INT of INT_STATUS, one flag for both sensors, cleared by the read |
+| `accel_read()`, `gyro_read()`, `imu_read()`, `imu_read_temp()` | `Accelerometer`, `Gyroscope`, `Imu`: milli-g, milli-degrees per second, and both from one burst of fourteen registers, the second form with the die temperature that the burst holds between the two |
+| `accel_ready()`, `gyro_ready()`, `imu_ready()` | DATA_RDY_INT of INT_STATUS, one flag for both sensors, cleared by the read |
 | `accel_range()`, `accel_set_range(r)`, `gyro_range()`, `gyro_set_range(r)` | the full scales, changed without touching the self-test bits |
 | `accel_rate_hz()`, `accel_set_rate_hz(hz)`, `gyro_rate_hz()`, `gyro_set_rate_hz(hz)` | the sample rate in whole hertz, shared by both sensors; the slowest rate at or above `hz`; 0 puts the sensor's three axes in standby |
+| `imu_set_rate_hz(hz)`, `imu_rate_hz()`, `imu_standby(accel, gyro)` | `ImuControl`: the one divider both sensors share, left alone by the standby, and the standby of the accelerometer's three axes and the gyroscope's three, set and cleared in one write |
 | `rate_mhz()`, `set_rate_mhz(mhz)`, `dlpf()`, `set_dlpf(cfg)` | the sample rate in thousandths of a hertz, and the digital low-pass filter |
 | `mode()`, `set_mode(m)`, `set_wake_rate(ctrl)`, `set_clock(sel)`, `set_temp_enabled(on)` | sleep, run and cycle, the wake-up rate of cycle mode, the clock source and TEMP_DIS |
 | `temp_read()` | `Thermometer`: the die temperature |
 | `device_id()` | `Identifiable`: WHO_AM_I, 0x68 |
-| `fifo_begin(with_gyro)`, `fifo_end()` | turn the FIFO on with the accelerometer, and the gyroscope when asked, and off |
+| `accel_fifo_config(mode, n)`, `fifo_end()` | turn the FIFO on in stream mode, with the accelerometer and the gyroscope when its axes are running, and off; `AccelFifoStop` is refused |
 | `accel_fifo_count()`, `accel_fifo_read(dst)`, `fifo_take_imu(accel, gyro)` | the FIFO: the sample count, the accelerometer's samples, and both sensors' |
 | `route_int(mask)`, `configure_pin(active_low, open_drain)`, `status()` | the interrupt pin and INT_STATUS |
 | `accel_test()`, `gyro_test()`, `accel_trim()`, `gyro_trim()` | the self-test responses and the factory trims they are compared with |
@@ -198,13 +199,16 @@ The framing is `i2c_read_into` and `i2c_write`, generic over `I2cBus`.
 ### The FIFO
 
 The FIFO is an option. It is 1024 bytes and `begin` leaves it off.
-`fifo_begin` resets it, chooses what it holds and turns it on. It holds the
-accelerometer's six bytes, and the gyroscope's six too when asked, at the
-sample rate, in the order of the registers, so a sample is 12 bytes for both
-sensors and 6 for the accelerometer. The part has no watermark and no
-packet header: the program reads the count, `accel_fifo_count()`, which is
-the byte count of FIFO_COUNT divided by the bytes of a sample, or takes the
-overflow flag to the pin.
+`accel_fifo_config` resets it, chooses what it holds and turns it on
+(`AccelFifoStream`; `AccelFifoOff` is `fifo_end`). It holds the
+accelerometer's six bytes, and the gyroscope's six too when the gyroscope's
+axes are out of standby, at the sample rate, in the order of the registers, so a sample is 12 bytes for both
+sensors and 6 for the accelerometer. The part has no watermark, no
+stop-on-full mode and no packet header: the watermark that
+`accel_fifo_config` takes is checked to be 1 to 32 and not used,
+`accel_fifo_watermark_reached` answers the trait's `false`, and the program
+reads the count, `accel_fifo_count()`, which is the byte count of FIFO_COUNT
+divided by the bytes of a sample, or takes the overflow flag to the pin.
 
 When the FIFO is full the oldest byte is lost, and 1024 is not a multiple of
 12 or of 6, so the bytes that remain no longer start at a sample. A count of
@@ -226,14 +230,16 @@ external sensor) reads as empty.
 3. WHO_AM_I is 0x68 for the MPU-6050 at both addresses. The MPU-6500,
    MPU-9250 and clones answer other values and have other register maps, so
    `begin` accepts only 0x68.
-4. Reading INT_STATUS clears its flags. `accel_ready` and `gyro_ready` read
-   the one DATA_RDY_INT flag, so the second of two calls in a row answers
-   `false` until the next sample. A program that wants both reads `status()`
-   once.
-5. The sample rate is one for both sensors. `accel_set_rate_hz(hz)` sets
-   the divider and takes the accelerometer out of standby; the gyroscope
-   follows the same divider. A rate of 0 puts only that sensor's axes in
-   standby. The rate follows the filter: a divider that gives 100 Hz with
+4. Reading INT_STATUS clears its flags. `accel_ready`, `gyro_ready` and
+   `imu_ready` read the one DATA_RDY_INT flag, so the second of two calls in
+   a row answers `false` until the next sample. A program that reads both
+   sensors polls `imu_ready` once and reads `imu_read` (`dev_imu.imu_poll`
+   does so).
+5. The sample rate is one for both sensors. `imu_set_rate_hz(hz)` sets the
+   divider and leaves the standby alone; `accel_set_rate_hz(hz)` sets it and
+   takes the accelerometer out of standby, and the gyroscope follows the same
+   divider. A rate of 0 through `accel_set_rate_hz` puts only that sensor's
+   axes in standby; `imu_standby` does so for either or both. The rate follows the filter: a divider that gives 100 Hz with
    the filter on gives 800 Hz with it off.
 6. The accelerometer-only low-power mode is `Mpu6050Cycle`: CYCLE set,
    SLEEP clear, the temperature sensor off and the gyroscope axes in
@@ -276,6 +282,20 @@ external sensor) reads as empty.
   on its own clock and the program reads the data-ready flag or the line.
   The interrupt line as `AsyncDeviceReady` needs an edge source on
   `BoardGpio` that embedded-hal-nv does not have.
+
+## Where the traits fall short
+
+- `AccelerometerAsync`, `GyroscopeAsync` and `ThermometerAsync` are not
+  implemented: `async fn` is refused at the embedded tier, and a `@value`
+  driver cannot implement them.
+- `AsyncDeviceReady` has no source, because `BoardGpio` has no `AsyncEdge`.
+- A trait method gets a plain `self`, so the driver keeps no state between
+  calls. The part has no FIFO watermark, and there is nowhere to keep one:
+  `accel_fifo_config` takes the watermark and does not use it, and
+  `accel_fifo_watermark_reached` answers `false`.
+- The part's FIFO has no stop-on-full mode, so `AccelFifoStop` is refused.
+- The `GyroRange` values beyond ±250 to ±2000 dps are refused: the part
+  has four ranges.
 
 ## Related packages
 

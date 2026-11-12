@@ -11,11 +11,11 @@
 // read is 2, the address, the register, the count, -1.
 
 use std.test
-use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut }
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_accel.{ AccelMilliG, AccelRange, AccelFifoMode, Accelerometer }
 use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
-use dev_imu.{ ImuSample, Imu }
+use dev_imu.{ ImuSample, Imu, ImuControl }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 use mpu6050
@@ -598,6 +598,12 @@ fn test_the_range_codes_run_from_the_narrowest_up() [io, hw]
     test.assert_eq(mpu6050.gyro_fs_of(GyroRange500dps), 1)
     test.assert_eq(mpu6050.gyro_fs_of(GyroRange1000dps), 2)
     test.assert_eq(mpu6050.gyro_fs_of(GyroRange2000dps), 3)
+    // The five ranges the part does not have.
+    test.assert_eq(mpu6050.gyro_fs_of(GyroRange15dps), -1)
+    test.assert_eq(mpu6050.gyro_fs_of(GyroRange31dps), -1)
+    test.assert_eq(mpu6050.gyro_fs_of(GyroRange62dps), -1)
+    test.assert_eq(mpu6050.gyro_fs_of(GyroRange125dps), -1)
+    test.assert_eq(mpu6050.gyro_fs_of(GyroRange4000dps), -1)
 
 @test
 fn test_the_sensitivities_are_the_product_specifications() [io, hw]
@@ -682,6 +688,30 @@ fn test_a_paired_sample_has_both_from_one_burst_at_their_own_ranges() [io, hw]
         None    => test.assert(false)
 
 @test
+fn test_a_paired_sample_carries_the_die_temperature_of_the_same_burst() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    put_accel(c, 8192, 0, 4096)
+    put_gyro(c, 131, -131, 0)
+    put16(c, 0x41, 340)
+    c.regs.insert(0x1C, 0x08)
+    log_clear(c)
+    match mpu6050.imu_read_temp_of(d)
+        Some(s) =>
+            test.assert_eq(s.accel.x, 1000)
+            test.assert_eq(s.accel.z, 500)
+            test.assert_eq(s.gyro.x, 1000)
+            test.assert_eq(s.gyro.y, -1000)
+            test.assert_eq(s.temp.milli_c, 37530)
+        None    => test.assert(false)
+    // The same two transactions as the paired sample without the temperature.
+    log_is(c, [2, 0x68, 0x1B, 2, -1, 2, 0x68, 0x3B, 14, -1])
+    c.st.insert(4, 0)
+    test.assert(mpu6050.imu_read_temp_of(d) == None)
+    let e = chip()
+    test.assert(mpu6050.imu_read_temp_of(flaky_read(e, 0x3B, 1)) == None)
+
+@test
 fn test_no_part_gives_no_sample_and_is_never_ready() [io, hw]
     let c = chip()
     c.st.insert(4, 0)
@@ -740,6 +770,10 @@ fn test_a_range_is_changed_without_touching_the_self_test_bits() [io, hw]
     test.assert(mpu6050.gyro_range_write(d, GyroRange1000dps))
     test.assert_eq(reg_of(c, 0x1B), 0x50)
     test.assert(mpu6050.gyro_range_read(d) == GyroRange1000dps)
+    // A range the part does not have is refused and the register stays.
+    test.assert(not mpu6050.gyro_range_write(d, GyroRange125dps))
+    test.assert(not mpu6050.gyro_range_write(d, GyroRange4000dps))
+    test.assert_eq(reg_of(c, 0x1B), 0x50)
     c.st.insert(4, 0)
     test.assert(not mpu6050.accel_range_write(d, AccelRange4g))
     test.assert(not mpu6050.gyro_range_write(d, GyroRange500dps))
@@ -899,6 +933,57 @@ fn test_the_part_is_asleep_after_a_reset_and_run_wakes_it() [io, hw]
     test.assert_eq(reg_of(c, 0x6B), 0x01)
 
 @test
+fn test_imu_control_sets_the_one_divider_both_sensors_share() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // The filter at 44 Hz: the output is 1 kHz.
+    c.regs.insert(0x1A, 0x03)
+    test.assert_eq(mpu6050.imu_rate_write(d, 100), 100)
+    test.assert_eq(reg_of(c, 0x19), 9)
+    test.assert_eq(mpu6050.imu_rate_read(d), 100)
+    // The slowest rate at or above 3 Hz is 1000 / 256, 3.9 Hz, which reads
+    // as 4 Hz.
+    test.assert_eq(mpu6050.imu_rate_write(d, 3), 4)
+    test.assert_eq(mpu6050.imu_rate_write(d, 0), 4)
+    test.assert_eq(reg_of(c, 0x19), 255)
+    test.assert_eq(mpu6050.imu_rate_read(d), 4)
+    // Beyond the output rate takes the output rate.
+    test.assert_eq(mpu6050.imu_rate_write(d, 5000), 1000)
+    // The standby of the axes is left as it is.
+    c.regs.insert(0x6C, 0x3F)
+    test.assert_eq(mpu6050.imu_rate_write(d, 50), 50)
+    test.assert_eq(reg_of(c, 0x6C), 0x3F)
+    test.assert_eq(mpu6050.imu_rate_read(d), 50)
+    // A part that does not answer takes none and reads none.
+    c.st.insert(4, 0)
+    test.assert_eq(mpu6050.imu_rate_write(d, 100), 0)
+    test.assert_eq(mpu6050.imu_rate_read(d), 0)
+
+@test
+fn test_imu_control_puts_the_axes_in_standby_and_takes_them_out() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // The wake-up rate bits stay.
+    c.regs.insert(0x6C, 0x80)
+    test.assert(mpu6050.imu_standby_write(d, true, false))
+    test.assert_eq(reg_of(c, 0x6C), 0xB8)
+    test.assert(mpu6050.imu_standby_write(d, false, true))
+    test.assert_eq(reg_of(c, 0x6C), 0x87)
+    test.assert(mpu6050.imu_standby_write(d, true, true))
+    test.assert_eq(reg_of(c, 0x6C), 0xBF)
+    test.assert(mpu6050.imu_standby_write(d, false, false))
+    test.assert_eq(reg_of(c, 0x6C), 0x80)
+    // The ready flag clears on read, once for both.
+    test.assert(not mpu6050.data_ready_of(d))
+    c.st.insert(41, 0x01)
+    test.assert(mpu6050.data_ready_of(d))
+    test.assert(not mpu6050.data_ready_of(d))
+    // A part that refuses.
+    c.st.insert(4, 0)
+    test.assert(not mpu6050.imu_standby_write(d, true, true))
+    test.assert(not mpu6050.imu_standby_write(flaky_write(chip(), 0x6C, 1), true, true))
+
+@test
 fn test_cycle_mode_is_the_four_steps_of_the_register_map() [io, hw]
     // CYCLE set, SLEEP clear, TEMP_DIS set, the gyroscope axes in standby.
     let c = chip()
@@ -1035,6 +1120,32 @@ fn test_the_fifo_is_reset_with_fifo_en_clear_then_configured_then_enabled() [io,
     test.assert_eq(seen[3], 0x6A)
     test.assert(mpu6050.fifo_start(d, false))
     test.assert_eq(reg_of(c, 0x23), 0x08)
+
+@test
+fn test_the_trait_configures_the_fifo_in_stream_mode_with_the_gyroscope_that_runs() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // The gyroscope runs: the sample is 12 bytes.
+    test.assert(mpu6050.fifo_configure(d, AccelFifoMode.AccelFifoStream, 8))
+    test.assert_eq(reg_of(c, 0x23), 0x78)
+    test.assert_eq(reg_of(c, 0x6A), 0x40)
+    // The gyroscope's axes in standby: the accelerometer alone.
+    c.regs.insert(0x6C, 0x07)
+    test.assert(mpu6050.fifo_configure(d, AccelFifoMode.AccelFifoStream, 32))
+    test.assert_eq(reg_of(c, 0x23), 0x08)
+    // Off empties the FIFO and clears its layout.
+    test.assert(mpu6050.fifo_configure(d, AccelFifoMode.AccelFifoOff, 0))
+    test.assert_eq(reg_of(c, 0x23), 0x00)
+    test.assert_eq(reg_of(c, 0x6A), 0x00)
+    // The part has no stop-on-full mode, and a watermark of 1 to 32 only.
+    log_clear(c)
+    test.assert(not mpu6050.fifo_configure(d, AccelFifoMode.AccelFifoStop, 8))
+    test.assert(not mpu6050.fifo_configure(d, AccelFifoMode.AccelFifoStream, 0))
+    test.assert(not mpu6050.fifo_configure(d, AccelFifoMode.AccelFifoStream, 33))
+    log_is(c, [])
+    // A part that does not answer takes nothing.
+    c.st.insert(4, 0)
+    test.assert(not mpu6050.fifo_configure(d, AccelFifoMode.AccelFifoStream, 8))
 
 @test
 fn test_a_fifo_start_that_a_register_refuses_fails() [io, hw]
@@ -1466,7 +1577,8 @@ fn test_the_i2c_type_over_absent_hardware() [io, hw]
     test.assert(not p.route_int(1))
     test.assert(not p.configure_pin(true, false))
     test.assert(p.status() == None)
-    test.assert(not p.fifo_begin(true))
+    test.assert(not p.accel_fifo_config(AccelFifoMode.AccelFifoStream, 10))
+    test.assert(not p.accel_fifo_watermark_reached())
     test.assert(not p.fifo_end())
     var a: Vec[AccelMilliG; 32] = Vec.new()
     var g: Vec[GyroMilliDps; 32] = Vec.new()
@@ -1490,6 +1602,11 @@ fn test_the_i2c_type_over_absent_hardware() [io, hw]
     test.assert(not p.gyro_set_range(GyroRange500dps))
     test.assert_eq(p.gyro_rate_hz(), 0)
     test.assert(p.imu_read() == None)
+    test.assert(p.imu_read_temp() == None)
+    test.assert(not p.imu_ready())
+    test.assert_eq(p.imu_set_rate_hz(100), 0)
+    test.assert_eq(p.imu_rate_hz(), 0)
+    test.assert(not p.imu_standby(true, false))
     test.assert_eq(p.temp_start(), 0)
     test.assert(p.temp_read() == None)
     test.assert(p.device_id() == None)

@@ -77,11 +77,11 @@
 // functions `i2c_read_into` and `i2c_write`, so a test runs them over a
 // double of the bus.
 
-use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut }
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_accel.{ AccelMilliG, AccelRange, AccelFifoMode, Accelerometer }
 use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
-use dev_imu.{ ImuSample, Imu }
+use dev_imu.{ ImuSample, ImuSampleT, Imu, ImuControl }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 
@@ -279,13 +279,16 @@ pub fn gyro_range_of(cfg: Int) -> GyroRange
         2 => GyroRange1000dps
         _ => GyroRange2000dps
 
-// The FS_SEL code for a range.
+// The FS_SEL code for a range, -1 for a range the part does not have: the
+// five that `GyroRange` holds beyond ±250 to ±2000 dps (±15.625 to ±125 and
+// ±4000 dps).
 pub fn gyro_fs_of(r: GyroRange) -> Int
     match r
         GyroRange250dps  => 0
         GyroRange500dps  => 1
         GyroRange1000dps => 2
         GyroRange2000dps => 3
+        _                => -1
 
 // The accelerometer's counts per g (PS § 6.2).
 pub fn lsb_per_g(cfg: Int) -> Int
@@ -364,6 +367,19 @@ pub fn imu_read_of<P: Mpu6050Port>(p: P) -> ?ImuSample [hw]
     Some(ImuSample { accel: accel_at(b, 0, lsb_per_g(r[1] as Int)),
         gyro: gyro_at(b, 8, tenth_lsb_per_dps(r[0] as Int)) })
 
+// The same burst with the die temperature, which sits between the two in
+// the registers: the paired sample and the temperature of one instant.
+pub fn imu_read_temp_of<P: Mpu6050Port>(p: P) -> ?ImuSampleT [hw]
+    var r: DevBytes = Vec.new()
+    if not p.read_regs(GYRO_CONFIG, 2, var r)
+        return None
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(ACCEL_XOUT_H, 14, var b)
+        return None
+    Some(ImuSampleT { accel: accel_at(b, 0, lsb_per_g(r[1] as Int)),
+        gyro: gyro_at(b, 8, tenth_lsb_per_dps(r[0] as Int)),
+        temp: temp_at(b, 6) })
+
 // INT_STATUS, whose flags clear when it is read: `None` when the part did
 // not answer.
 pub fn int_status<P: Mpu6050Port>(p: P) -> ?Int [hw]
@@ -399,9 +415,13 @@ pub fn gyro_range_read<P: Mpu6050Port>(p: P) -> GyroRange [hw]
     gyro_range_of(reg_read(p, GYRO_CONFIG) ?? 0)
 
 // Sets the gyroscope range and leaves the self-test bits: whether the part
-// took it.
+// took it.  A range the part does not have is refused and nothing is
+// written.
 pub fn gyro_range_write<P: Mpu6050Port>(p: P, r: GyroRange) -> Bool [hw]
-    reg_update(p, GYRO_CONFIG, 0x18, gyro_fs_of(r) << 3)
+    let code = gyro_fs_of(r)
+    if code < 0
+        return false
+    reg_update(p, GYRO_CONFIG, 0x18, code << 3)
 
 // The digital low-pass filter, DLPF_CFG 0 to 6 (RM § 4.3), or -1 when the
 // part did not answer.  0 is 260 Hz for the accelerometer and 256 Hz for the
@@ -524,6 +544,31 @@ pub fn gyro_rate_hz_read<P: Mpu6050Port>(p: P) -> Int [hw]
 // The gyroscope's rate taken in whole hertz after `hz` was asked for.
 pub fn gyro_rate_hz_write<P: Mpu6050Port>(p: P, hz: Int) -> Int [hw]
     hz_of_mhz(gyro_rate_write(p, hz * 1000))
+
+// The sample rate both sensors share, in whole hertz, for `ImuControl`: 0
+// when the part did not answer.  The standby of the axes does not change
+// it.
+pub fn imu_rate_read<P: Mpu6050Port>(p: P) -> Int [hw]
+    hz_of_mhz(rate_read(p))
+
+// Sets the divider both sensors share to the slowest rate at or above `hz`
+// and answers the rate taken in whole hertz: 0 when the part did not take
+// it.  The standby of the axes is left as it is; a request below 1 Hz takes
+// the slowest rate (`rate_write`).
+pub fn imu_rate_write<P: Mpu6050Port>(p: P, hz: Int) -> Int [hw]
+    hz_of_mhz(rate_write(p, hz * 1000))
+
+// Puts the accelerometer's three axes and the gyroscope's three in standby,
+// or takes them out of it, for `ImuControl`: whether the part took it.  The
+// two are set in one write of PWR_MGMT_2, which keeps the wake-up rate
+// bits.
+pub fn imu_standby_write<P: Mpu6050Port>(p: P, accel: Bool, gyro: Bool) -> Bool [hw]
+    var v = 0
+    if accel
+        v = v | PM2_STBY_ACCEL
+    if gyro
+        v = v | PM2_STBY_GYRO
+    reg_update(p, PWR_MGMT_2, PM2_STBY_ACCEL | PM2_STBY_GYRO, v)
 
 // ── Power ────────────────────────────────────────────────────────────
 
@@ -671,6 +716,25 @@ pub fn fifo_start<P: Mpu6050Port>(p: P, with_gyro: Bool) -> Bool [hw]
     if not reg_write(p, FIFO_EN, en)
         return false
     reg_update(p, USER_CTRL, UC_FIFO_EN, UC_FIFO_EN)
+
+// What the FIFO does, for `Accelerometer.accel_fifo_config`: whether the
+// part took every setting.  `AccelFifoOff` turns it off and empties it
+// (`fifo_stop`).  `AccelFifoStream` turns it on with the accelerometer
+// batched, and the gyroscope too when its axes are out of standby, since a
+// sample of both is the part's form for an IMU.  The part overwrites the
+// oldest byte when the FIFO is full and has no stop-on-full mode, so
+// `AccelFifoStop` is refused.  The part has no watermark either: the
+// watermark is checked to be 1 to 32 and not used, and
+// `accel_fifo_watermark_reached` keeps the trait's `false`: the registers
+// hold no watermark and a trait method holds no state to keep one in
+// (planning page 3.5, the row on the FIFO watermark).
+pub fn fifo_configure<P: Mpu6050Port>(p: P, mode: AccelFifoMode, watermark: Int) -> Bool [hw]
+    if mode == AccelFifoOff
+        return fifo_stop(p)
+    if mode == AccelFifoStop or watermark < 1 or watermark > LIST_DEPTH
+        return false
+    let Some(pm2) = reg_read(p, PWR_MGMT_2) else return false
+    fifo_start(p, (pm2 & PM2_STBY_GYRO) == 0)
 
 // Turns the FIFO off and empties it: whether the part took every setting.
 pub fn fifo_stop<P: Mpu6050Port>(p: P) -> Bool [hw]
@@ -1057,12 +1121,11 @@ pub fn start<P: Mpu6050Port>(p: P) -> Bool [hw]
 // ── The part on an I2C bus ───────────────────────────────────────────
 
 // An MPU-6050 on a board's I2C bus at the address `w.addr`, 0x68 or 0x69,
-// with the board's GPIO for the INT line and its timer.
+// with the board's GPIO for the INT line.
 pub @value
 struct Mpu6050
     bus: BoardI2c
     pins: BoardGpio
-    timer: BoardTimer
     w: DeviceWiring
 
 impl Mpu6050Port for Mpu6050
@@ -1079,13 +1142,13 @@ impl Mpu6050Port for Mpu6050
         irq_level_of(self.pins, self.w)
 
     fn wait_us(self, us: Int) [hw]
-        self.timer.delay_us(us)
+        self.bus.delay_us(us)
 
 impl Mpu6050
     // The part at `w.addr` on the board's I2C bus, as a board's device
     // table builds it.  Nothing is sent.
     fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Mpu6050
-        Mpu6050 { bus: bus, pins: pins, timer: BoardTimer { id: 0 }, w: w }
+        Mpu6050 { bus: bus, pins: pins, w: w }
 
     // Brings the part up (`start`).
     fn begin(self) -> Bool [hw]
@@ -1144,10 +1207,8 @@ impl Mpu6050
     fn status(self) -> ?Int [hw]
         int_status(self)
 
-    // The FIFO: on, off, and both sensors' samples.
-    fn fifo_begin(self, with_gyro: Bool) -> Bool [hw]
-        fifo_start(self, with_gyro)
-
+    // The FIFO: off, and both sensors' samples.  It is turned on with
+    // `Accelerometer.accel_fifo_config`.
     fn fifo_end(self) -> Bool [hw]
         fifo_stop(self)
 
@@ -1199,6 +1260,12 @@ impl Accelerometer[hw] for Mpu6050
     fn accel_fifo_read(self, var dst: Vec[AccelMilliG; 32]) -> Int [hw]
         fifo_read(self, var dst)
 
+    // Stream mode or off; the part has no watermark, so
+    // `accel_fifo_watermark_reached` is the trait's (planning page 3.5,
+    // the row on the FIFO watermark).
+    fn accel_fifo_config(self, mode: AccelFifoMode, watermark: Int) -> Bool [hw]
+        fifo_configure(self, mode, watermark)
+
 impl Gyroscope[hw] for Mpu6050
     fn gyro_read(self) -> ?GyroMilliDps [hw]
         gyro_read_of(self)
@@ -1219,6 +1286,26 @@ impl Gyroscope[hw] for Mpu6050
 impl Imu[hw] for Mpu6050
     fn imu_read(self) -> ?ImuSample [hw]
         imu_read_of(self)
+
+    // The die temperature from the same burst of fourteen registers.
+    fn imu_read_temp(self) -> ?ImuSampleT [hw]
+        imu_read_temp_of(self)
+
+impl ImuControl[hw] for Mpu6050
+    // The one data-ready flag both sensors share, which clears when it is
+    // read.
+    fn imu_ready(self) -> Bool [hw]
+        data_ready_of(self)
+
+    // The one divider both sensors share.
+    fn imu_set_rate_hz(self, hz: Int) -> Int [hw]
+        imu_rate_write(self, hz)
+
+    fn imu_rate_hz(self) -> Int [hw]
+        imu_rate_read(self)
+
+    fn imu_standby(self, accel: Bool, gyro: Bool) -> Bool [hw]
+        imu_standby_write(self, accel, gyro)
 
 impl Thermometer[hw] for Mpu6050
     // The sensor converts by itself while the part runs, so nothing is
