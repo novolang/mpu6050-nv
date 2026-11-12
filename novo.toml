@@ -1,6 +1,6 @@
 [package]
 name        = "mpu6050-nv"
-version     = "0.1.0"
+version     = "0.2.0"
 description = "A driver for TDK InvenSense's MPU-6050 six-axis motion tracking device on an I2C bus: the acceleration in milli-g and the rate of turn in milli-degrees per second at the range and sample rate set, the digital low-pass filter, the power modes and the clock source, the data-ready interrupt, the FIFO, the temperature, the self-tests with their factory trims and WHO_AM_I, as devices-nv's Accelerometer, Gyroscope, Imu, Thermometer and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"

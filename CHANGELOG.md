@@ -1,9 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-11-12
 
-Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
-are path dependencies until they are published.
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0. The release depends on both.
 
 - `ImuControl` is implemented: `imu_ready` reads the shared data-ready flag,
   `imu_set_rate_hz` and `imu_rate_hz` set and read the divider both sensors
